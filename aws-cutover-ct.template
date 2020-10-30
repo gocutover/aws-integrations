@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS Control Tower Lifecycle Events for Cutover
+  Solution code MPCT-xldglsgs
+Metadata: 
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: 
+          default: "Cutover Configuration"
+        Parameters: 
+          - APIKey 
+          - ExternalId
+          - ExternalAccountId
+      - Label: 
+          default: "Backend Configuration - No Changes Required"
+        Parameters:
+          - CutoverTemplateURL
+          - CutoverHTTPEndpoint
+    ParameterLabels:
+      CutoverTemplateURL: 
+        default: "Template"
+      ExternalId: 
+        default: "Cutover ID"
+      ExternalAccountId: 
+        default: "Cutover Account"
+      CutoverHTTPEndpoint: 
+        default: "Cutover Endpoint"
+      APIKey: 
+        default: "Cutover API Key"
+Parameters:
+  CutoverTemplateURL:
+    Description: >-
+      Cutover CloudFormation template URL, provisions integration Role and required components
+    Type: String
+    Default: 'https://racuov.s3.amazonaws.com/aws-cutover-base.template' #TODO tweak
+  ExternalId:
+    Description: External ID for the Cutover Role 
+    Type: String
+    AllowedPattern: ".+"
+    ConstraintDescription: ExternalId required
+  ExternalAccountId:
+    Description:  Cutover AWS account ID allowed to assume the IAM role
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    ConstraintDescription: Account Id required
+  CutoverHTTPEndpoint:
+    Description:  Cutover HTTP Endpoint
+    Type: String
+    AllowedPattern: "http.+"
+    Default: "https://controltower.test.cutover.cloud/ingest"
+    ConstraintDescription: HTTP endpoint required
+  APIKey:
+    Description:  Cutover API Key
+    Type: String
+    AllowedPattern: ".+"
+    ConstraintDescription: API Key is required
+    NoEcho: true
+
+Resources:
+  CutoverSecretString:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Cutover Information
+      Name: CutoverSecretString
+      SecretString:
+        Fn::Join:
+        - ''
+        - - '{"ExternalId":"'
+          - !Ref ExternalId
+          - '", "ExternalAccountId":"'
+          - !Ref ExternalAccountId
+          - '", "API_KEY":"'
+          - !Ref APIKey
+          - '"}'
+
+  CutoverStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties: 
+      AdministrationRoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/AWSControlTowerStackSetRole"
+      Capabilities: ['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM', 'CAPABILITY_AUTO_EXPAND']
+      Description: "Integration Role for Cutover"
+      ExecutionRoleName: "AWSControlTowerExecution"
+      Parameters: 
+        - ParameterKey: ExternalId
+          ParameterValue: !Ref ExternalId
+        - ParameterKey: ExternalAccountId
+          ParameterValue: !Ref ExternalAccountId
+      PermissionModel: "SELF_MANAGED"
+      StackSetName: "CutoverIntegration"
+      TemplateURL: !Ref CutoverTemplateURL
+
+  ControlTowerLifeCycleEvent:
+    DependsOn: [TriggerCustomizationOnLifeCycleEvent]
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Capture Control Tower LifeCycle Events and Trigger Cutover Actions
+      EventPattern:
+        detail:
+          eventName: # TODO tweak evens further
+          - CreateManagedAccount
+          - UpdateManagedAccount
+          eventSource:
+          - controltower.amazonaws.com
+        detail-type:
+        - AWS Service Event via CloudTrail
+        source:
+        - aws.controltower
+      Name: Cutover-ControlTower-LifecycleEvents
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt "TriggerCustomizationOnLifeCycleEvent.Arn"
+        Id: ControlTowerLifeCycleEventsToCutover
+
+  LambdaRoleToCaptureEvents:
+    Type: AWS::IAM::Role
+    DependsOn: [CutoverSecretString]
+    Properties:
+      RoleName: Cutover-CT-LCE-Responder
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition: {}
+      Path: /
+      Policies:
+        - PolicyName: RequiredPermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:CreateStackInstances'
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stackset/*:*"
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref CutoverSecretString
+            
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TriggerCustomizationOnLifeCycleEvent:
+    DependsOn: [LambdaRoleToCaptureEvents]
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import os
+          import json
+          import boto3
+          import urllib
+          import logging
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO) #TODO WARNING
+
+
+          def makeRequest(url, body, type, headers={}):
+              body = json.dumps(body)
+              headers['Content-Type'] = "application/json"
+              headers['User-Agent'] = "MadeUp/1.0"
+              headers['Content-Length'] = len(body)
+              opener = urllib.request.build_opener(urllib.request.HTTPHandler)
+              request = urllib.request.Request(
+                  url,
+                  data=body.encode('utf-8'),
+                  headers=headers
+              )
+              request.get_method = lambda: type
+              response = opener.open(request)
+              resp_body = response.read().decode("utf-8")
+              if not resp_body:
+                  resp_body = response.msg
+
+              # TODO REMOVE AFTER TESTING
+              LOGGER.info('HTTP Response [{}]: {}'.format(
+                  response.getcode(), response.msg))
+              return resp_body
+
+
+          def lambda_handler(event, context):
+              stackset_name = "CutoverIntegration"
+              http_ep = os.environ['httpEndPoint']
+              SM = boto3.client('secretsmanager')
+              CFT = boto3.client('cloudformation')
+
+              eventDetails = event['detail']
+              regionName = eventDetails['awsRegion']
+              eventName = eventDetails['eventName']
+              srvEventDetails = eventDetails['serviceEventDetails']
+
+              if eventName == 'CreateManagedAccount':
+                  newAccInfo = srvEventDetails['createManagedAccountStatus']
+                  cmdStatus = newAccInfo['state']
+                  if cmdStatus == 'SUCCEEDED':
+                      '''Sucessful'''
+                      accId = newAccInfo['account']['accountId']
+                      accName = newAccInfo['account']['accountName']
+                      try:
+                          result = CFT.create_stack_instances(
+                              StackSetName=stackset_name,
+                              Accounts=[accId],
+                              Regions=[regionName]
+                          )
+                          LOGGER.info('{} Instance Created'.format(stackset_name))
+                          role = "arn:aws:iam::{}:role/Cutover-Integration-Role".format(
+                              accId
+                          )
+
+                          resp = SM.get_secret_value(
+                              SecretId=os.environ['secretArn']
+                          )
+                          api = json.loads(resp['SecretString'])
+                          headers = {
+                            "X-Api-Key": api['API_KEY']
+                          }
+
+                          request_body = {
+                              "AccountId": accId,
+                              "AccountName": accName,
+                              "RoleArn": role,
+                              "Action": eventName,
+                              "Region": regionName
+                          }
+                          resp = makeRequest(http_ep, request_body, 'POST', headers)
+
+                      except Exception as e:
+                          LOGGER.error('Unable to launch in:{}, REASON: {}'.format(
+                              stackset_name,
+                              e)
+                          )
+                  else:
+                      '''Unsucessful'''
+                      LOGGER.info('Unsucessful Event Recieved. SKIPPING :{}'.format(
+                          event))
+                      return(False)
+              elif eventName == 'UpdateManagedAccount':
+                  newAccInfo = srvEventDetails['updateManagedAccountStatus']
+                  cmdStatus = newAccInfo['state']
+                  if cmdStatus == 'SUCCEEDED':
+                      '''Sucessful'''
+                      accId = newAccInfo['account']['accountId']
+                      accName = newAccInfo['account']['accountName']
+                      try:
+                          result = CFT.create_stack_instances(
+                              StackSetName=stackset_name,
+                              Accounts=[accId],
+                              Regions=[regionName]
+                          )
+                          LOGGER.info('{} Instance Created'.format(stackset_name))
+                      except Exception as e:
+                          LOGGER.error('Unable to launch in:{}, REASON: {}'.format(
+                              stackset_name,
+                              e)
+                          )
+                  else:
+                      '''Unsucessful'''
+                      LOGGER.info('Unsucessful Event Recieved. SKIPPING :{}'.format(
+                          event))
+                      return(False)
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          secretArn: !Ref CutoverSecretString
+          httpEndPoint: !Ref CutoverHTTPEndpoint
+      MemorySize: 128
+      Role: !GetAtt "LambdaRoleToCaptureEvents.Arn"
+      Runtime: python3.7
+      Timeout: 60
+
+  PermissionForEventsToInvokeLambdachk:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt "TriggerCustomizationOnLifeCycleEvent.Arn"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt "ControlTowerLifeCycleEvent.Arn"
