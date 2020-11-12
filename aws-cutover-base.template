@@ -5,13 +5,11 @@ Parameters:
     Description: External ID for the Cutover Role 
     Type: String
     AllowedPattern: ".+"
-    Default: "test" #TODO REMOVE
     ConstraintDescription: ExternalId required
   ExternalAccountId:
     Description:  Cutover AWS account ID allowed to assume the IAM role
     Type: String
     AllowedPattern: "^[0-9]{12}$"
-    Default: "123456789012" #TODO REMOVE 
     ConstraintDescription: Account Id required
 
 Resources:
@@ -30,6 +28,6 @@ Resources:
               StringEquals:
                 'sts:ExternalId': !Ref ExternalId
       Path: /
-      RoleName: Cutover-Integration-Role #TODO CUSTOMIZE?
+      RoleName: Cutover-Integration-Role 
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore #TODO PERMISSIONS FROM JACK
+        - arn:aws:iam::aws:policy/AWSServiceCatalogAdminFullAccess 
