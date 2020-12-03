@@ -45,7 +45,7 @@ Parameters:
     Description:  Cutover HTTP Endpoint
     Type: String
     AllowedPattern: "http.+"
-    Default: "https://controltower.test.cutover.cloud/ingest"
+    Default: "https://control-tower-ingest.staging.cutover.cloud"
     ConstraintDescription: HTTP endpoint required
   APIKey:
     Description:  Cutover API Key
